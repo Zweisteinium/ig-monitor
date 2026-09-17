@@ -1,0 +1,6 @@
+[project]
+name = "ig-monitor"
+version = "0.1.0"
+description = "Headless Instagram unfollow monitor with Telegram notifications"
+requires-python = ">=3.12"
+dependencies = ["curl_cffi>=0.16"]

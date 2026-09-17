@@ -1,0 +1,17 @@
+services:
+  ig-monitor:
+    build: .
+    container_name: ig-monitor
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      # main loop touches data/heartbeat every 30 s
+      test: ["CMD", "python", "-c", "import os,sys,time;sys.exit(time.time()-os.path.getmtime('/app/data/heartbeat')>300)"]
+      interval: 5m
+      timeout: 10s
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}
