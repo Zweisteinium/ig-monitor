@@ -10,8 +10,10 @@ services:
     healthcheck:
       # main loop touches data/heartbeat every 30 s
       test: ["CMD", "python", "-c", "import os,sys,time;sys.exit(time.time()-os.path.getmtime('/app/data/heartbeat')>300)"]
-      interval: 5m
+      interval: 1m
       timeout: 10s
+      start_period: 30s
+      start_interval: 5s
     logging:
       driver: json-file
       options: {max-size: "5m", max-file: "3"}
