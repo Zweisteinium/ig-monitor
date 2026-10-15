@@ -1,5 +1,6 @@
 import argparse
 import html
+import json
 import logging
 import random
 import sys
@@ -9,7 +10,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
 from . import config, state, telegram
-from .instagram import Client, IGError, RateLimited, SessionInvalid, load_creds, save_creds
+from .instagram import Client, IGError, RateLimited, SessionInvalid, human_pause, load_creds, save_creds
 
 log = logging.getLogger("ig-monitor")
 run_lock = threading.Lock()
@@ -43,10 +44,20 @@ def user_line(u: dict, link: bool = True) -> str:
     return f"• {handle}" + (f" — {full}" if full else "")
 
 
-def run_check(scheduled: bool = True, dry_run: bool = False) -> str:
-    """One full check. Returns a one-line result (reply for /check). Caller holds run_lock."""
+def load_import(path: str) -> dict[str, dict]:
+    """Follower list collected in the real browser by collect.js."""
+    data = json.loads(open(path).read())
+    if not data.get("complete") or not data.get("users"):
+        sys.exit("import file is incomplete (collector stopped early): not diffing a partial list")
+    return {str(u["pk"]): {"username": u.get("username", ""), "full_name": u.get("full_name", "")}
+            for u in data["users"]}
+
+
+def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | None = None) -> str:
+    """One full check. Returns a one-line result (reply for /check). Caller holds run_lock.
+    With `imported` no request is sent to Instagram at all."""
     st = state.load()
-    notify = print if dry_run else telegram.send
+    notify = telegram.send if config.TELEGRAM_BOT_TOKEN and not dry_run else print
 
     def commit() -> None:
         if not dry_run:
@@ -69,28 +80,30 @@ def run_check(scheduled: bool = True, dry_run: bool = False) -> str:
         commit()
         return f"session invalid: {reason}"
 
-    st["last_attempt"] = time.time()
-    if scheduled:
-        schedule_next(st)
-    commit()
-
-    creds = load_creds()
-    if not creds.get("sessionid") or not creds.get("csrftoken"):
-        return session_alert("no cookies configured")
+    ig, my_id, official = None, st.get("my_user_id"), None
+    if imported is None:
+        st["last_attempt"] = time.time()
+        if scheduled:
+            schedule_next(st)
+        commit()
+        creds = load_creds()
+        if not creds["cookies"].get("sessionid") or not creds["cookies"].get("csrftoken"):
+            return session_alert("no cookies configured")
 
     try:
-        ig = Client(creds, persist=not dry_run)
-        my_id, official = creds.get("ds_user_id") or st.get("my_user_id"), None
-        try:
-            my_id, official = ig.profile()
-        except (SessionInvalid, RateLimited):
-            raise
-        except IGError as e:
-            log.warning("official count unavailable: %s", e)
-        if not my_id:
-            return fail("own user id unknown (set IG_DS_USER_ID)", alert=True)
-        time.sleep(random.uniform(config.PAGE_SLEEP_MIN_S, config.PAGE_SLEEP_MAX_S))
-        new = ig.followers(my_id, official)
+        if imported is None:
+            ig = Client(creds, persist=not dry_run)
+            my_id = creds["cookies"].get("ds_user_id") or my_id
+            try:
+                my_id, official = ig.profile()
+            except (SessionInvalid, RateLimited):
+                raise
+            except IGError as e:
+                log.warning("official count unavailable: %s", e)
+            if not my_id:
+                return fail("own user id unknown (set IG_DS_USER_ID)", alert=True)
+            human_pause(config.PAGE_SLEEP_MIN_S, config.PAGE_SLEEP_MAX_S)
+        new = imported if imported is not None else ig.followers(my_id, official)
 
         old = st["followers"]
         reference = official if official is not None else len(old)
@@ -120,17 +133,18 @@ def run_check(scheduled: bool = True, dry_run: bool = False) -> str:
             followers[pk] = {**u, "first_seen": (prev or {}).get("first_seen", ts), "last_seen": ts}
 
         for i, pk in enumerate(pk for pk in old if pk not in new):
-            kind, i_follow = ig.classify_gone(pk) if i < config.MAX_VERIFY_GONE else ("unverified", None)
+            kind, i_follow = ig.classify_gone(pk) if ig and i < config.MAX_VERIFY_GONE else ("unverified", None)
             if kind == "following":  # list endpoint dropped them, still a follower
                 log.info("%s missing from list but still following", old[pk]["username"])
                 followers[pk] = old[pk]
                 continue
             note = {True: "you still follow them", False: "you don't follow them (anymore) either"}.get(i_follow)
             if kind == "unverified":
-                note = "unverified"
+                note = "unfollowed or deactivated, open the profile to see" if ig is None else "unverified"
             u = dict(old[pk], note=note if kind != "deactivated" else None)
             sections["deactivated" if kind == "deactivated" else "unfollow"].append((pk, u))
-            time.sleep(random.uniform(1, 2))
+            if ig:
+                human_pause(3, 8)
     except SessionInvalid as e:
         return session_alert(str(e))
     except RateLimited as e:
@@ -147,7 +161,7 @@ def run_check(scheduled: bool = True, dry_run: bool = False) -> str:
     st.update(last_success=ts, failures=0, last_session_alert=0)
 
     parts = []
-    for key, title, link in (("unfollow", "Unfollowed you", True),
+    for key, title, link in (("unfollow", "Unfollowed you" if ig else "No longer following you", True),
                              ("deactivated", "Deactivated / deleted", False),
                              ("follow", "New followers", True)):
         if sections[key]:
@@ -206,13 +220,14 @@ def cmd_history() -> str:
 
 def cmd_session(arg: str, message_id: int) -> str:
     telegram.delete(message_id)  # keep the cookie out of the chat history
-    pairs = dict(p.strip().split("=", 1) for p in arg.replace("\n", ";").split(";") if "=" in p)
-    new = {k: v.strip().strip('"') for k, v in pairs.items() if k in ("sessionid", "csrftoken", "ds_user_id")}
+    # accepts the browser's whole cookie string; the full jar (mid, ig_did, datr, ...) is what a real browser sends
+    new = {k.strip(): v.strip().strip('"') for k, v in
+           (p.split("=", 1) for p in arg.replace("\n", ";").split(";") if "=" in p)}
     if not new.get("sessionid"):
-        return "Usage: /session sessionid=…; csrftoken=…"
-    creds = {**load_creds(), **new, "www_claim": "0"}
-    if "ds_user_id" not in new:
-        creds["ds_user_id"] = new["sessionid"].split("%3A")[0].split(":")[0]
+        return "Usage: /session <cookie string containing sessionid=…; csrftoken=…>"
+    new.setdefault("ds_user_id", new["sessionid"].split("%3A")[0].split(":")[0])
+    creds = load_creds()
+    creds.update(cookies={**creds["cookies"], **new}, www_claim="0")
     try:
         username = Client(creds, persist=False).validate()
     except SessionInvalid as e:
@@ -250,21 +265,25 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="run one check and exit")
     ap.add_argument("--dry-run", action="store_true", help="print instead of Telegram, never write state")
+    ap.add_argument("--import", dest="import_file", metavar="FILE",
+                    help="diff a list collected in the browser by collect.js; sends nothing to Instagram")
     args = ap.parse_args()
     setup_logging()
 
-    if not args.dry_run and not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
-        sys.exit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
-
-    if args.once or args.dry_run:
-        print(run_check(scheduled=not args.dry_run, dry_run=args.dry_run))
+    if args.import_file:
+        print(run_check(scheduled=False, dry_run=args.dry_run, imported=load_import(args.import_file)))
         return
+    if args.once or args.dry_run:
+        print(run_check(scheduled=False, dry_run=args.dry_run))
+        return
+    if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
+        sys.exit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required for daemon mode")
 
     threading.Thread(target=telegram.poll, args=(handle,), daemon=True).start()
     log.info("started, interval %.1fh", config.CHECK_INTERVAL_HOURS)
     while True:
         config.HEARTBEAT_FILE.touch()
-        if time.time() >= state.load().get("next_run", 0):
+        if time.time() >= state.load().get("next_run", 0) and datetime.now().hour in config.ACTIVE_HOURS:
             with run_lock:
                 try:
                     run_check()

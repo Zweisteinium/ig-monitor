@@ -4,6 +4,8 @@ import random
 import re
 import time
 
+from urllib.parse import parse_qsl, urlsplit
+
 from curl_cffi import requests
 from curl_cffi.requests.exceptions import RequestException
 
@@ -30,62 +32,97 @@ class NotFound(IGError):
     pass
 
 
+# never replayed from the captured request: set per call or owned by the HTTP stack
+_SKIP_HEADERS = {"cookie", "host", "content-length", "connection", "accept-encoding", "referer"}
+
+
+def parse_curl(text: str) -> tuple[dict, dict, dict]:
+    """(headers, cookies, query) from a DevTools "Copy as cURL" of the followers request."""
+    text = text.replace("'\\''", "\x00")
+    headers = {k.strip().lower(): v.strip().replace("\x00", "'")
+               for k, v in re.findall(r"-H \$?'([^:']+):([^']*)'", text)}
+    cookie = headers.get("cookie") or (re.search(r"(?:-b|--cookie) \$?'([^']*)'", text) or [None, ""])[1]
+    cookies = dict(p.strip().split("=", 1) for p in cookie.split(";") if "=" in p)
+    url = re.search(r"curl\s+(?:-X\s+\w+\s+)?\$?'([^']+)'", text)
+    query = dict(parse_qsl(urlsplit(url[1]).query)) if url else {}
+    query.pop("max_id", None)
+    return {k: v for k, v in headers.items() if k not in _SKIP_HEADERS}, cookies, query
+
+
 def load_creds() -> dict:
-    """session.json (written by /session or cookie rotation) overrides .env."""
-    creds = {k: os.environ.get(f"IG_{k.upper()}", "").strip() for k in COOKIE_KEYS}
-    creds.update({k: v for k, v in state.read_json(config.SESSION_FILE, {}).items() if v})
-    if not creds.get("ds_user_id") and (m := re.match(r"\d+", creds.get("sessionid", ""))):
-        creds["ds_user_id"] = m.group()
+    """{'cookies', 'headers', 'query'}. Sources: .env seed, then data/request.curl and
+    data/session.json (rotated cookies, /session) in order of age, newest wins."""
+    creds = {"cookies": {k: v for k in COOKIE_KEYS if (v := os.environ.get(f"IG_{k.upper()}", "").strip())},
+             "headers": {}, "query": {}}
+    files = [p for p in (config.REQUEST_FILE, config.SESSION_FILE) if p.exists()]
+    for path in sorted(files, key=lambda p: p.stat().st_mtime):
+        if path == config.REQUEST_FILE:
+            creds["headers"], cookies, creds["query"] = parse_curl(path.read_text())
+            claim = creds["headers"].get("x-ig-www-claim")
+        else:
+            data = state.read_json(path, {})
+            cookies = data.get("cookies") or {k: data[k] for k in COOKIE_KEYS if data.get(k)}  # v0.1 layout
+            claim = data.get("www_claim")
+        creds["cookies"].update(cookies)
+        if claim:
+            creds["www_claim"] = claim
+    c = creds["cookies"]
+    if not c.get("ds_user_id") and (m := re.match(r"\d+", c.get("sessionid", ""))):
+        c["ds_user_id"] = m.group()
     return creds
 
 
 def save_creds(creds: dict) -> None:
-    state.write_json(config.SESSION_FILE, creds, mode=0o600)
+    state.write_json(config.SESSION_FILE, {"cookies": creds["cookies"], "www_claim": creds.get("www_claim", "0")},
+                     mode=0o600)
 
 
-def _platform(ua: str) -> str:
-    for needle, name in (("Windows", "Windows"), ("Macintosh", "macOS"), ("Linux", "Linux")):
-        if needle in ua:
-            return name
-    return "Windows"
+def human_pause(lo: float, hi: float) -> None:
+    """Scroll-like rhythm: mostly short gaps, now and then a longer reading pause."""
+    time.sleep(random.uniform(lo, hi) + (random.uniform(6, 20) if random.random() < 0.12 else 0))
 
 
 class Client:
     def __init__(self, creds: dict, persist: bool = True):
-        self.creds = dict(creds)
+        self.creds = {**creds, "cookies": dict(creds["cookies"])}
         self.persist = persist
         self.username = config.IG_USERNAME
-        self.s = requests.Session(impersonate=config.IG_IMPERSONATE)
-        for k in COOKIE_KEYS:
-            if self.creds.get(k):
-                self.s.cookies.set(k, self.creds[k], domain=".instagram.com")
+        self.template = creds.get("headers") or {}
+        if not self.template:
+            log.warning("no %s: falling back to generic headers and a partial cookie jar, "
+                        "which does not look like your browser", config.REQUEST_FILE)
+        ua = self.template.get("user-agent", "")
+        self.s = requests.Session(impersonate=config.IG_IMPERSONATE or ("firefox" if "Firefox/" in ua else "chrome"))
+        for k, v in self.creds["cookies"].items():
+            self.s.cookies.set(k, v, domain=".instagram.com")
+        # one page load = one web session id
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+        self.web_session_id = ":".join("".join(random.choices(alphabet, k=6)) for _ in range(3))
 
     def _headers(self, referer: str) -> dict:
-        h = {
-            "Accept": "*/*",
-            "Referer": referer,
-            "X-IG-App-ID": config.IG_APP_ID,
-            "X-IG-WWW-Claim": self.creds.get("www_claim", "0"),
-            "X-CSRFToken": self.creds.get("csrftoken", ""),
-            "X-Requested-With": "XMLHttpRequest",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
+        h = dict(self.template) or {
+            "accept": "*/*",
+            "x-ig-app-id": config.IG_APP_ID,
+            "x-asbd-id": config.IG_ASBD_ID,
+            "x-requested-with": "XMLHttpRequest",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
-        if config.IG_USER_AGENT:
-            h["User-Agent"] = config.IG_USER_AGENT
-            if config.IG_IMPERSONATE.startswith("chrome"):
-                h["sec-ch-ua-platform"] = f'"{_platform(config.IG_USER_AGENT)}"'
+        h.update({"referer": referer,
+                  "x-csrftoken": self.creds["cookies"].get("csrftoken", ""),
+                  "x-ig-www-claim": self.creds.get("www_claim", "0")})
+        if "x-web-session-id" in h:
+            h["x-web-session-id"] = self.web_session_id
         return h
 
     def _rotate(self, resp) -> None:
         """Persist cookies / claim header that Instagram refreshed."""
         changed = False
         for c in self.s.cookies.jar:
-            if c.name in ("sessionid", "csrftoken") and c.value not in (None, "", '""'):
-                if c.value != self.creds.get(c.name):
-                    self.creds[c.name] = c.value
-                    changed = True
+            if c.value not in (None, "", '""') and c.value != self.creds["cookies"].get(c.name):
+                self.creds["cookies"][c.name] = c.value
+                changed = True
         claim = resp.headers.get("x-ig-set-www-claim")
         if claim and claim != self.creds.get("www_claim"):
             self.creds["www_claim"] = claim
@@ -153,12 +190,12 @@ class Client:
         except IGError as e:
             # endpoint gone/changed: the followers endpoint also requires a login
             log.warning("validate endpoint failed (%s), falling back to followers page", e)
-            self._followers_page(self.creds["ds_user_id"], None)
+            self._followers_page(self.creds["cookies"]["ds_user_id"], None)
             return config.IG_USERNAME
 
     def profile(self) -> tuple[str, int]:
         """Own (user_id, official follower count). Also learns the real username."""
-        user_id = self.creds.get("ds_user_id")
+        user_id = self.creds["cookies"].get("ds_user_id")
         if user_id:  # authenticated and far less throttled than web_profile_info
             user = self._get(config.EP_USER_INFO.format(user_id=user_id), referer=f"{config.IG_BASE}/").get("user") or {}
             if user.get("username"):
@@ -172,7 +209,7 @@ class Client:
         return str(user["id"]), int(user["edge_followed_by"]["count"])
 
     def _followers_page(self, user_id: str, max_id: str | None) -> dict:
-        params = {"count": config.PAGE_SIZE, "search_surface": "follow_list_page"}
+        params = dict(self.creds.get("query") or {"count": config.PAGE_SIZE, "search_surface": "follow_list_page"})
         if max_id:
             params["max_id"] = max_id
         return self._get(config.EP_FOLLOWERS.format(user_id=user_id), params)
@@ -180,7 +217,7 @@ class Client:
     def followers(self, user_id: str, expected: int | None) -> dict[str, dict]:
         """Full follower list keyed by pk (deduplicated)."""
         users: dict[str, dict] = {}
-        max_pages = (expected or 10000) // max(1, min(config.PAGE_SIZE, 12)) + 20
+        max_pages = (expected or 10000) // 10 + 20
         max_id, seen_cursors = None, set()
         for page in range(max_pages):
             body = self._followers_page(user_id, max_id)
@@ -191,7 +228,7 @@ class Client:
             if not max_id or max_id in seen_cursors:
                 return users
             seen_cursors.add(max_id)
-            time.sleep(random.uniform(config.PAGE_SLEEP_MIN_S, config.PAGE_SLEEP_MAX_S))
+            human_pause(config.PAGE_SLEEP_MIN_S, config.PAGE_SLEEP_MAX_S)
         raise IGError(f"pagination did not terminate after {max_pages} pages")
 
     def classify_gone(self, pk: str) -> tuple[str, bool | None]:
@@ -201,7 +238,7 @@ class Client:
                 self._get(config.EP_USER_INFO.format(user_id=pk))
             except NotFound:
                 return "deactivated", None
-            time.sleep(random.uniform(1, 2))
+            human_pause(2, 5)
             show = self._get(config.EP_FRIENDSHIP.format(user_id=pk))
             return ("following" if show.get("followed_by") else "unfollow"), bool(show.get("following"))
         except (SessionInvalid, RateLimited):
