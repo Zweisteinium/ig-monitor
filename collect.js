@@ -13,7 +13,8 @@
   const nativeFetch = window.fetch;
   const X = XMLHttpRequest.prototype;
   const nativeXhr = { open: X.open, setRequestHeader: X.setRequestHeader, send: X.send };
-  let template = null, cursor = null, timer = null, running = false;
+  const MAX_PAGES = 1000; // 12 per page: ~12k followers
+  let template = null, cursor = null, timer = null, running = false, finished = false;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // mostly short gaps, now and then a longer reading pause
@@ -27,20 +28,37 @@
   }
 
   function finish(complete, reason) {
+    if (finished) return;
+    finished = true;
+    cursor = null;
     restore();
     const day = new Date().toISOString().slice(0, 10);
-    const blob = new Blob([JSON.stringify({ version: 1, collected_at: new Date().toISOString(), complete,
-                                            users: [...users.values()] })], { type: "application/json" });
-    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob),
-                                                           download: `followers-${day}.json` });
+    const json = JSON.stringify({ version: 1, collected_at: new Date().toISOString(), complete,
+                                  users: [...users.values()] });
+    window.collectResult = json; // fallback if the download is blocked: copy(collectResult)
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([json], { type: "application/json" })),
+      download: `followers-${day}.json` });
+    document.body.appendChild(a);
     a.click();
-    console.log(`[collect] ${complete ? "done" : "STOPPED (" + reason + ")"}: ${users.size} followers`);
+    a.remove();
+    console.log(`[collect] ${complete ? "done" : "STOPPED (" + reason + ")"}: ${users.size} followers, ` +
+                `saved followers-${day}.json (no download? run copy(collectResult) and paste into that file)`);
   }
+
+  // manual exit: stops paging and saves what was collected
+  window.collectStop = () => finish(true, "stopped manually");
 
   async function loop() {
     running = true;
-    while (cursor) {
+    const cursors = new Set();
+    let idle = 0;
+    for (let page = 0; cursor && !finished; page++) {
+      // the list never ends on its own reliably: Instagram keeps issuing cursors that return nothing new
+      if (page >= MAX_PAGES) return finish(false, `no end after ${MAX_PAGES} pages`);
+      cursors.add(cursor);
       await pause();
+      if (finished) return;
       const url = new URL(template.url, location.origin);
       url.searchParams.set("max_id", cursor);
       let r, body;
@@ -51,9 +69,13 @@
       } catch (e) {
         return finish(false, String(e));
       }
+      const before = users.size;
       add(body);
+      idle = users.size > before ? 0 : idle + 1;
       console.log(`[collect] ${users.size} followers`);
-      cursor = body.next_max_id && String(body.next_max_id) !== cursor ? String(body.next_max_id) : null;
+      const next = body.next_max_id ? String(body.next_max_id) : null;
+      if (!next || cursors.has(next) || body.has_more === false || idle >= 2) break;
+      cursor = next;
     }
     finish(true);
   }
