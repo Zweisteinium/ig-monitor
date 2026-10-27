@@ -9,7 +9,8 @@ import time
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
-from . import config, state, telegram
+from . import config, lists, state, telegram
+from .telegram import user_line
 from .instagram import Client, IGError, RateLimited, SessionInvalid, human_pause, load_creds, save_creds
 
 log = logging.getLogger("ig-monitor")
@@ -37,23 +38,65 @@ def schedule_next(st: dict, extra: float = 0) -> None:
     st["next_run"] = time.time() + config.CHECK_INTERVAL_HOURS * 3600 + jitter + extra
 
 
-def user_line(u: dict, link: bool = True) -> str:
-    name = html.escape(u.get("username", "?"))
-    handle = f'<a href="https://instagram.com/{name}">@{name}</a>' if link else f"@{name}"
-    full = html.escape(u.get("full_name") or "")
-    return f"• {handle}" + (f" — {full}" if full else "")
+def load_import(paths: list[str]) -> tuple[dict, dict[str, dict]]:
+    """Lists collected in the real browser by collect.js. Several runs of the same list within 24 h are
+    merged (each run of a ranked list misses a few accounts). v1 files are always my own followers."""
+    runs = []
+    for path in paths:
+        data = json.loads(open(path).read())
+        if not data.get("complete") or not data.get("users"):
+            sys.exit(f"{path}: incomplete (collector stopped early): not diffing a partial list")
+        data.setdefault("kind", "followers")
+        data.setdefault("target", None)
+        data["_at"] = datetime.fromisoformat(data["collected_at"].replace("Z", "+00:00"))
+        runs.append(data)
+    runs.sort(key=lambda d: d["_at"])
+    key = lambda d: (d["kind"], str((d["target"] or {}).get("id")))
+    if len({key(d) for d in runs}) > 1:
+        sys.exit("these files are different lists: merge only runs of the same account and kind")
+    if (runs[-1]["_at"] - runs[0]["_at"]).total_seconds() > 24 * 3600:
+        sys.exit("these runs are more than 24 h apart: real changes in between would be hidden")
+    data, users = dict(runs[-1]), {}
+    for d in runs:  # oldest first, so the newest username wins
+        users.update({str(u["pk"]): {"username": u.get("username", ""), "full_name": u.get("full_name", "")}
+                      for u in d["users"]})
+    data.pop("_at")
+    data["expected"] = max((d.get("expected") or 0 for d in runs), default=0) or None
+    data["limited"] = any(d.get("limited") for d in runs)
+    data["target"] = next((d["target"] for d in reversed(runs) if (d["target"] or {}).get("username")), data["target"])
+    data["viewer_id"] = next((d.get("viewer_id") for d in runs if d.get("viewer_id")), None)
+    if len(runs) > 1:
+        log.info("merged %d runs: %d accounts", len(runs), len(users))
+    return data, users
 
 
-def load_import(path: str) -> dict[str, dict]:
-    """Follower list collected in the real browser by collect.js."""
-    data = json.loads(open(path).read())
-    if not data.get("complete") or not data.get("users"):
-        sys.exit("import file is incomplete (collector stopped early): not diffing a partial list")
-    return {str(u["pk"]): {"username": u.get("username", ""), "full_name": u.get("full_name", "")}
-            for u in data["users"]}
+def run_import(paths: list[str], dry_run: bool) -> str:
+    """Own followers -> unfollow check (state.json); any other list -> snapshot diff (data/lists/)."""
+    data, users = load_import(paths)
+    st = state.load()
+    target_id = str(data["target"]["id"]) if data["target"] else None
+    # own id: the account the state belongs to, else the logged-in browser account
+    own_id = st.get("my_user_id") or data.get("viewer_id")
+    if data["kind"] == "followers" and (target_id is None or target_id == own_id):
+        if data.get("limited"):
+            sys.exit("Instagram limited this list: not diffing a partial list")
+        before = st.get("last_success")
+        result = run_check(scheduled=False, dry_run=dry_run, imported=users, my_id=own_id,
+                           official=data.get("expected"))
+        # also keep it as a snapshot for viewer.html, but only if the check accepted the list
+        if not dry_run and own_id and data.get("collected_at") and state.load().get("last_success") != before:
+            lists.save_snapshot(data, users, data["target"] or {"id": own_id, "username": None})
+        return result
+    report, summary = lists.import_list(data, users, own_id, st["followers"], dry_run)
+    if config.TELEGRAM_BOT_TOKEN and not dry_run:
+        telegram.send(report)
+    else:
+        print(report)
+    return summary
 
 
-def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | None = None) -> str:
+def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | None = None,
+              my_id: str | None = None, official: int | None = None) -> str:
     """One full check. Returns a one-line result (reply for /check). Caller holds run_lock.
     With `imported` no request is sent to Instagram at all."""
     st = state.load()
@@ -80,7 +123,7 @@ def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | No
         commit()
         return f"session invalid: {reason}"
 
-    ig, my_id, official = None, st.get("my_user_id"), None
+    ig, my_id = None, st.get("my_user_id") or my_id
     if imported is None:
         st["last_attempt"] = time.time()
         if scheduled:
@@ -265,13 +308,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="run one check and exit")
     ap.add_argument("--dry-run", action="store_true", help="print instead of Telegram, never write state")
-    ap.add_argument("--import", dest="import_file", metavar="FILE",
-                    help="diff a list collected in the browser by collect.js; sends nothing to Instagram")
+    ap.add_argument("--import", dest="import_file", metavar="FILE", nargs="+",
+                    help="diff followers/following lists collected by collect.js (several runs of one list "
+                         "are merged); sends nothing to Instagram")
     args = ap.parse_args()
     setup_logging()
 
     if args.import_file:
-        print(run_check(scheduled=False, dry_run=args.dry_run, imported=load_import(args.import_file)))
+        print(run_import(args.import_file, args.dry_run))
         return
     if args.once or args.dry_run:
         print(run_check(scheduled=False, dry_run=args.dry_run))

@@ -12,6 +12,8 @@ SESSION_FILE = DATA_DIR / "session.json"
 # DevTools "Copy as cURL" of the followers request: exact headers + full cookie jar of the real browser
 REQUEST_FILE = DATA_DIR / "request.curl"
 HEARTBEAT_FILE = DATA_DIR / "heartbeat"
+# collect.js snapshots of other lists: lists/<user id>/<followers|following>/<timestamp>.json
+LISTS_DIR = DATA_DIR / "lists"
 LOG_FILE = DATA_DIR / "monitor.log"
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 

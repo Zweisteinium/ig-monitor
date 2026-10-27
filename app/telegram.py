@@ -1,3 +1,4 @@
+import html
 import logging
 import time
 
@@ -8,6 +9,13 @@ from . import config
 log = logging.getLogger("ig-monitor.telegram")
 
 MAX_LEN = 4000
+
+
+def user_line(u: dict, link: bool = True) -> str:
+    name = html.escape(u.get("username", "?"))
+    handle = f'<a href="https://instagram.com/{name}">@{name}</a>' if link else f"@{name}"
+    full = html.escape(u.get("full_name") or "")
+    return f"• {handle}" + (f" — {full}" if full else "")
 
 
 def call(method: str, http_timeout: int = 20, **params) -> dict:

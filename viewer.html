@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Follower Snapshots</title>
+<!-- Offline viewer: open this file in the browser and choose the data folder. Nothing is uploaded. -->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #16181d; --muted: #667085; --line: #e3e6eb;
+    --accent: #3b5bdb; --add: #2b8a3e; --add-bg: #ebfbee; --del: #c92a2a; --del-bg: #fff5f5;
+    --ren: #9c6500; --ren-bg: #fff9db; --both: #495057; --both-bg: #f1f3f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101216; --panel: #181b21; --text: #e6e8ec; --muted: #8b93a1; --line: #2a2f38;
+      --accent: #748ffc; --add: #69db7c; --add-bg: #13261a; --del: #ff8787; --del-bg: #2c1515;
+      --ren: #ffd43b; --ren-bg: #2b2410; --both: #ced4da; --both-bg: #20242b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #101216; --panel: #181b21; --text: #e6e8ec; --muted: #8b93a1; --line: #2a2f38;
+    --accent: #748ffc; --add: #69db7c; --add-bg: #13261a; --del: #ff8787; --del-bg: #2c1515;
+    --ren: #ffd43b; --ren-bg: #2b2410; --both: #ced4da; --both-bg: #20242b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  label.btn, button { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
+  label.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  input[type=file] { display: none; }
+  .field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 280px; min-width: 0; }
+  .field span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  select, input[type=search] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); font: inherit; }
+  #drop.over { outline: 2px dashed var(--accent); outline-offset: 4px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 16px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .stat b { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+  .stat small { color: var(--muted); }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .col h2 { margin: 0; padding: 10px 14px; font-size: 14px; display: flex; justify-content: space-between; }
+  .col.add h2 { background: var(--add-bg); color: var(--add); }
+  .col.del h2 { background: var(--del-bg); color: var(--del); }
+  .col.ren h2 { background: var(--ren-bg); color: var(--ren); }
+  .col.both h2 { background: var(--both-bg); color: var(--both); }
+  ul { list-style: none; margin: 0; padding: 4px 0; max-height: 60vh; overflow: auto; }
+  li { padding: 6px 14px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  li:first-child { border-top: 0; }
+  li a { color: var(--text); text-decoration: none; font-weight: 600; }
+  li a:hover { color: var(--accent); }
+  li small { display: block; color: var(--muted); }
+  .empty { padding: 10px 14px; color: var(--muted); }
+  .note { color: var(--muted); margin: 12px 0 0; }
+  .warn { color: var(--ren); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main id="drop">
+  <h1>Follower snapshots</h1>
+  <p class="sub">Choose the project's <code>data</code> folder (or drop JSON files here). Everything stays in this tab.</p>
+
+  <div class="panel">
+    <div class="row">
+      <label class="btn primary">Choose data folder<input id="dir" type="file" webkitdirectory multiple></label>
+      <label class="btn">Add files<input id="files" type="file" accept=".json,application/json" multiple></label>
+      <span id="loaded" class="sub" style="margin:0"></span>
+    </div>
+    <div class="row" id="pickers" style="margin-top:14px" hidden>
+      <label class="field"><span>Before (A)</span><select id="a"></select></label>
+      <button id="swap" title="Swap A and B">⇄</button>
+      <label class="field"><span>After (B)</span><select id="b"></select></label>
+    </div>
+  </div>
+
+  <section id="result" hidden>
+    <div class="stats" id="stats"></div>
+    <div class="row" style="margin-bottom:12px">
+      <label class="field"><span>Filter</span><input id="q" type="search" placeholder="username or name"></label>
+    </div>
+    <div class="cols" id="cols"></div>
+    <p class="note" id="notes"></p>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const snaps = new Map(); // key -> {key, id, kind, at, users: Map(pk -> {username, full_name}), limited, source}
+  const names = new Map(); // target id -> newest known username
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const fmt = (iso) => iso ? new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "?";
+  const listKey = (s) => `${s.id}/${s.kind}`;
+  const listName = (s) => `@${names.get(s.id) || s.id} · ${s.kind}`;
+
+  // snapshot (data/lists), raw collect.js download (v1/v2) or state.json; anything else is ignored
+  function parse(json, file) {
+    let id, kind, at, users, limited = false, username = null, source = "snapshot";
+    if (json.followers && !Array.isArray(json.followers) && json.my_user_id) {
+      id = String(json.my_user_id); kind = "followers"; at = json.last_success; source = "state.json";
+      users = Object.entries(json.followers);
+    } else if (json.users && json.collected_at) {
+      kind = json.kind || "followers";
+      id = json.target ? String(json.target.id) : "me";
+      username = json.target?.username || null;
+      at = json.collected_at; limited = !!json.limited;
+      users = Array.isArray(json.users) ? json.users.map((u) => [String(u.pk), u]) : Object.entries(json.users);
+      if (Array.isArray(json.users)) source = "download";
+      if (json.complete === false) return null;
+    } else return null;
+    if (!at) return null;
+    const map = new Map(users.map(([pk, u]) => [pk, { username: u.username || "", full_name: u.full_name || "" }]));
+    return { key: `${id}/${kind}/${new Date(at).toISOString()}`, id, kind, at, users: map, limited, source, username, file };
+  }
+
+  async function load(fileList) {
+    const files = [...fileList].filter((f) => f.name.endsWith(".json") && f.name !== "session.json");
+    for (const f of files) {
+      try {
+        const s = parse(JSON.parse(await f.text()), f.webkitRelativePath || f.name);
+        if (!s) continue;
+        if (!snaps.has(s.key) || snaps.get(s.key).source !== "snapshot") snaps.set(s.key, s);
+        const known = [...snaps.values()].filter((x) => x.id === s.id && x.username).sort((x, y) => x.at < y.at ? 1 : -1)[0];
+        if (known) names.set(s.id, known.username);
+      } catch { /* not ours */ }
+    }
+    render();
+  }
+
+  function sorted() {
+    return [...snaps.values()].sort((x, y) =>
+      listName(x).localeCompare(listName(y)) || (x.at < y.at ? 1 : -1));
+  }
+
+  function fillSelects() {
+    const groups = new Map();
+    for (const s of sorted()) {
+      if (!groups.has(listKey(s))) groups.set(listKey(s), []);
+      groups.get(listKey(s)).push(s);
+    }
+    const html = [...groups.values()].map((g) => `<optgroup label="${esc(listName(g[0]))}">` + g.map((s) =>
+      `<option value="${esc(s.key)}">${esc(listName(s))} — ${esc(fmt(s.at))} · ${s.users.size}` +
+      `${s.source === "state.json" ? " (current state)" : ""}${s.limited ? " (limited)" : ""}</option>`).join("") +
+      "</optgroup>").join("");
+    const [a, b] = [$("a").value, $("b").value];
+    $("a").innerHTML = $("b").innerHTML = html;
+    if (snaps.has(a) && snaps.has(b)) { $("a").value = a; $("b").value = b; return; }
+    // default: the two newest snapshots of the list with the most snapshots
+    const best = [...groups.values()].sort((x, y) => y.length - x.length)[0];
+    $("b").value = best[0].key;
+    $("a").value = (best[1] || best[0]).key;
+  }
+
+  function render() {
+    $("loaded").textContent = snaps.size ? `${snaps.size} snapshots of ${new Set([...snaps.values()].map(listKey)).size} lists` : "no snapshots found";
+    $("pickers").hidden = $("result").hidden = !snaps.size;
+    if (!snaps.size) return;
+    fillSelects();
+    compare();
+  }
+
+  function compare() {
+    const A = snaps.get($("a").value), B = snaps.get($("b").value);
+    if (!A || !B) return;
+    const same = listKey(A) === listKey(B);
+    const q = $("q").value.trim().toLowerCase();
+    const match = (u) => !q || u.username.toLowerCase().includes(q) || u.full_name.toLowerCase().includes(q);
+    const onlyB = [], onlyA = [], both = [], renamed = [];
+    for (const [pk, u] of B.users) {
+      const old = A.users.get(pk);
+      if (!old) onlyB.push(u);
+      else { both.push(u); if (old.username && old.username !== u.username) renamed.push({ ...u, old: old.username }); }
+    }
+    for (const [pk, u] of A.users) if (!B.users.has(pk)) onlyA.push(u);
+    const byName = (x, y) => x.username.localeCompare(y.username);
+    [onlyB, onlyA, both, renamed].forEach((l) => l.sort(byName));
+
+    const titles = same ? ["Added", "Removed"] : ["Only in B", "Only in A"];
+    $("stats").innerHTML = [
+      [A.users.size, `A · ${fmt(A.at)}`], [B.users.size, `B · ${fmt(B.at)}`],
+      [`+${onlyB.length}`, titles[0]], [`−${onlyA.length}`, titles[1]],
+      [both.length, same ? "Unchanged" : "In both"],
+    ].map(([n, t]) => `<div class="stat"><b>${n}</b><small>${esc(t)}</small></div>`).join("");
+
+    const item = (u) => `<li><a href="https://www.instagram.com/${encodeURIComponent(u.username)}/" target="_blank" rel="noopener">@${esc(u.username)}</a>` +
+      (u.old ? `<small>was @${esc(u.old)}</small>` : u.full_name ? `<small>${esc(u.full_name)}</small>` : "") + "</li>";
+    const col = (cls, title, list) => {
+      const shown = list.filter((u) => match(u) || (u.old && u.old.toLowerCase().includes(q)));
+      return `<div class="col ${cls}"><h2><span>${esc(title)}</span><span>${shown.length}${shown.length !== list.length ? ` / ${list.length}` : ""}</span></h2>` +
+        (shown.length ? `<ul>${shown.map(item).join("")}</ul>` : `<div class="empty">none</div>`) + "</div>";
+    };
+    $("cols").innerHTML = col("add", titles[0], onlyB) + col("del", titles[1], onlyA) +
+      (same ? col("ren", "Renamed", renamed) : col("both", "In both", both));
+
+    const notes = [];
+    if (A.at > B.at && same) notes.push("A is newer than B: added and removed are reversed.");
+    if (A.limited || B.limited) notes.push("<span class=warn>A limited list is incomplete: removals are not reliable.</span>");
+    if (!same) notes.push("Different lists: e.g. A = your following, B = your followers shows who does not follow back under “Only in A”.");
+    $("notes").innerHTML = notes.join(" ");
+  }
+
+  $("dir").onchange = (e) => load(e.target.files);
+  $("files").onchange = (e) => load(e.target.files);
+  $("a").onchange = $("b").onchange = compare;
+  $("q").oninput = compare;
+  $("swap").onclick = () => { [$("a").value, $("b").value] = [$("b").value, $("a").value]; compare(); };
+  const drop = $("drop");
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); load(e.dataTransfer.files); };
+</script>
+</body>
+</html>
