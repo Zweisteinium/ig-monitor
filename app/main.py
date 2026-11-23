@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -11,18 +12,22 @@ from logging.handlers import TimedRotatingFileHandler
 
 from . import config, lists, state, telegram
 from .telegram import user_line
-from .instagram import Client, IGError, RateLimited, SessionInvalid, human_pause, load_creds, save_creds
+from .instagram import Client, IGError, RateLimited, SessionInvalid, human_pause, load_creds, parse_curl, save_creds
 
 log = logging.getLogger("ig-monitor")
 run_lock = threading.Lock()
 
 HELP = (
-    "/status - last check, follower count, next run\n"
-    "/check - run a check now\n"
+    "/status - last check, follower count, session\n"
+    "/check - run a check now (needs request.curl, /check force runs without)\n"
     "/history - last 20 events\n"
-    "/session sessionid=...; csrftoken=... - renew Instagram cookies\n"
-    "/help - this list"
+    "/session sessionid=...; csrftoken=... - renew the cookies only\n"
+    "/help - this list\n\n"
+    "Or send me a file:\n"
+    "• request.curl (DevTools, followers request, Copy as cURL) renews the session with your browser's headers\n"
+    "• a list .json from collect.js is imported without contacting Instagram"
 )
+MAX_UPLOAD = 5 * 1024 * 1024
 
 
 def now_iso() -> str:
@@ -116,6 +121,7 @@ def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | No
 
     def session_alert(reason: str) -> str:
         log.error("session invalid: %s", reason)
+        st["session_invalid"] = True
         if scheduled and time.time() - st.get("last_session_alert", 0) > config.SESSION_ALERT_INTERVAL_S:
             st["last_session_alert"] = time.time()
             notify("Instagram session expired or missing "
@@ -160,6 +166,8 @@ def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | No
         if not old:
             st["followers"] = {pk: {**u, "first_seen": ts, "last_seen": ts} for pk, u in new.items()}
             st.update(last_success=ts, failures=0, last_session_alert=0)
+            if ig:
+                st["session_invalid"] = False
             commit()
             notify(f"Baseline saved: {len(new)} followers")
             return f"baseline saved: {len(new)} followers"
@@ -202,6 +210,8 @@ def run_check(scheduled: bool = True, dry_run: bool = False, imported: dict | No
                           for pk, u in sections[event]]
     st["followers"] = followers
     st.update(last_success=ts, failures=0, last_session_alert=0)
+    if ig:  # an import says nothing about the session
+        st["session_invalid"] = False
 
     parts = []
     for key, title, link in (("unfollow", "Unfollowed you" if ig else "No longer following you", True),
@@ -234,10 +244,12 @@ def cmd_status() -> str:
     st = state.load()
     failures = st.get("failures", 0)
     return (f"Last success: {st.get('last_success', 'never')}\n"
-            f"Followers: {len(st['followers'])} (official {st.get('official_count', '?')})\n"
-            f"Session: {'INVALID' if st.get('last_session_alert') else 'ok'}"
+            f"Followers: {len(st['followers'])} (official {st.get('official_count') or '?'})\n"
+            f"Session: {'INVALID, send a new request.curl' if st.get('session_invalid') or st.get('last_session_alert') else 'ok'}\n"
+            f"request.curl: {fmt_ts(config.REQUEST_FILE.stat().st_mtime) if config.REQUEST_FILE.exists() else 'missing'}"
             + (f"\nFailed runs in a row: {failures}" if failures else "")
-            + (f"\nNext run: {fmt_ts(st['next_run'])}" if st.get("next_run") else ""))
+            + ("\nAutomatic checks: off, use /check" if not config.CHECK_INTERVAL_HOURS
+               else f"\nNext run: {fmt_ts(st['next_run'])}" if st.get("next_run") else ""))
 
 
 def cmd_check(arg: str) -> None:
@@ -245,6 +257,10 @@ def cmd_check(arg: str) -> None:
         telegram.send("A check is already running.")
         return
     try:
+        if not config.REQUEST_FILE.exists() and arg != "force":
+            telegram.send("No request.curl yet, so the check would send generic headers instead of your browser's. "
+                          "Send it to me as a file (see /help), or use /check force to run anyway.")
+            return
         gap = time.time() - state.load().get("last_attempt", 0)
         if gap < config.MANUAL_CHECK_MIN_GAP_S and arg != "force":
             telegram.send(f"Last check was {int(gap // 60)} min ago. Use /check force to run anyway.")
@@ -278,10 +294,87 @@ def cmd_session(arg: str, message_id: int) -> str:
     except IGError as e:
         return f"Could not validate: {html.escape(str(e))}"
     save_creds(creds)
+    mark_session_ok()
     return f"Session valid, user @{html.escape(username)}. Send /check force to run now."
 
 
-def handle(text: str, message_id: int) -> None:
+def mark_session_ok() -> None:
+    # skipped while a check runs: that check writes the state itself
+    if run_lock.acquire(blocking=False):
+        try:
+            st = state.load()
+            st.update(session_invalid=False, last_session_alert=0)
+            state.save(st)
+        finally:
+            run_lock.release()
+
+
+def save_request(text: str, message_id: int) -> str:
+    """A DevTools "Copy as cURL" of the followers request: validated, then stored as data/request.curl."""
+    telegram.delete(message_id)  # it holds the whole session
+    headers, cookies, query = parse_curl(text)
+    if "/friendships/" not in text or not cookies.get("sessionid") or not cookies.get("csrftoken"):
+        return ("Not saved: that is not the friendships/…/followers/ request of a logged-in tab "
+                "(cookies sessionid and csrftoken are needed).")
+    creds = {"cookies": cookies, "headers": headers, "query": query, "www_claim": headers.get("x-ig-www-claim", "0")}
+    try:
+        username = Client(creds, persist=False).validate()
+    except SessionInvalid as e:
+        return f"Not saved, the session is invalid: {html.escape(str(e))}"
+    except IGError as e:
+        return f"Not saved, could not validate: {html.escape(str(e))}"
+    state.write_text(config.REQUEST_FILE, text, mode=0o600)
+    mark_session_ok()
+    log.info("request.curl renewed via Telegram")
+    return f"request.curl saved, session valid (@{html.escape(username)}). Send /check to run."
+
+
+def cmd_import(text: str) -> None:
+    """A list from collect.js, imported like --import: my followers are diffed, other lists snapshotted."""
+    if not run_lock.acquire(blocking=False):
+        telegram.send("A check is already running.")
+        return
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", dir=config.DATA_DIR) as f:
+            path = f.name
+            f.write(text)
+            f.flush()
+            result = run_import([f.name], dry_run=False)
+        telegram.send(html.escape(result))
+    except SystemExit as e:  # load_import rejects incomplete or mixed lists this way
+        telegram.send(f"Not imported: {html.escape(str(e.code).removeprefix(path + ': '))}")
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        telegram.send(f"Not imported: not a collect.js list ({type(e).__name__})")
+    finally:
+        run_lock.release()
+
+
+def cmd_file(doc: dict, message_id: int) -> None:
+    if (doc.get("file_size") or 0) > MAX_UPLOAD:
+        telegram.send("File too large.")
+        return
+    try:
+        text = telegram.download(doc["file_id"], MAX_UPLOAD).decode("utf-8", "replace")
+    except RuntimeError as e:
+        telegram.send(html.escape(str(e)))
+        return
+    if text.lstrip().startswith("curl "):
+        telegram.send(save_request(text, message_id))
+    elif (doc.get("file_name") or "").lower().endswith(".json"):
+        cmd_import(text)
+    else:
+        telegram.send("Send request.curl (DevTools: Copy as cURL) or a list .json from collect.js.")
+
+
+def handle(msg: dict) -> None:
+    if msg.get("document"):
+        threading.Thread(target=cmd_file, args=(msg["document"], msg["message_id"]), daemon=True).start()
+        return
+    text, message_id = msg["text"], msg["message_id"]
+    if text.lstrip().startswith("curl "):  # pasted instead of sent as a file
+        threading.Thread(target=lambda: telegram.send(save_request(text, message_id)), daemon=True).start()
+        return
     cmd, _, arg = text.strip().partition(" ")
     cmd, arg = cmd.split("@")[0].lower(), arg.strip()
     if cmd == "/check":
@@ -324,10 +417,12 @@ def main() -> None:
         sys.exit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required for daemon mode")
 
     threading.Thread(target=telegram.poll, args=(handle,), daemon=True).start()
-    log.info("started, interval %.1fh", config.CHECK_INTERVAL_HOURS)
+    log.info("started, %s", f"interval {config.CHECK_INTERVAL_HOURS:.1f}h" if config.CHECK_INTERVAL_HOURS
+             else "automatic checks off (only /check)")
     while True:
         config.HEARTBEAT_FILE.touch()
-        if time.time() >= state.load().get("next_run", 0) and datetime.now().hour in config.ACTIVE_HOURS:
+        if (config.CHECK_INTERVAL_HOURS and time.time() >= state.load().get("next_run", 0)
+                and datetime.now().hour in config.ACTIVE_HOURS):
             with run_lock:
                 try:
                     run_check()

@@ -54,6 +54,9 @@ To browse the history, open `viewer.html` in the browser (`xdg-open viewer.html`
 accounts; two different lists (e.g. my following vs my followers) show what is only in either one.
 It runs offline and reads only the files you choose.
 
+With the daemon running you can also send a downloaded list to the Telegram bot; it is imported
+the same way.
+
 ## B. Fetch from the server (convenient, residual risk)
 
 A replayed session can match the browser's headers, cookies and TLS, but never its JavaScript
@@ -61,7 +64,8 @@ telemetry and page loads. Prefer one-shot runs over the daemon.
 
 1. In the browser open your followers dialog, DevTools -> Network, filter `followers`, right click the
    `friendships/<id>/followers/` request -> Copy -> Copy as cURL (bash). Save it as `data/request.curl`
-   (git-ignored, contains your session). Close the tab without logging out.
+   (git-ignored, contains your session), or send it to the Telegram bot as a file: it validates the session,
+   stores it with mode 600 and deletes your message. Close the tab without logging out.
    This gives the tool the full cookie jar (`mid`, `ig_did`, `datr`, ...), the exact User-Agent and
    client hints, `x-asbd-id`, `x-ig-www-claim` and the dialog's own query parameters. The TLS
    fingerprint follows the captured User-Agent. Re-capture after browser updates or a new login.
@@ -71,13 +75,16 @@ telemetry and page loads. Prefer one-shot runs over the daemon.
 ```sh
 uv run --env-file .env python -m app.main --dry-run            # one check, prints only, writes nothing
 docker compose run --rm ig-monitor python -m app.main --once   # one check, then exit
-docker compose up -d --build                                   # daemon: every CHECK_INTERVAL_HOURS (>= 12, default 24), never at night
+docker compose up -d --build                                   # daemon: every CHECK_INTERVAL_HOURS (>= 12, default 24), never at night;
+                                                               # CHECK_INTERVAL_HOURS=0: no automatic checks, only /check
 docker compose logs -f --tail 100
 docker compose down
 ```
 
-Daemon Telegram commands: `/status`, `/check` (`/check force` within 1 h of the last run), `/history`,
-`/session <cookie string>` (validated, stored in `data/session.json`, message deleted), `/help`.
+Daemon Telegram commands: `/status`, `/check` (`/check force` within 1 h of the last run or without
+`data/request.curl`), `/history`, `/session <cookie string>` (validated, stored in `data/session.json`,
+message deleted), `/help`. Files sent to the bot: `request.curl` (renews the session) and list `.json` files
+from `collect.js` (diffed without contacting Instagram).
 Other chat ids are ignored.
 
 ## How it works

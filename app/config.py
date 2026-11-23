@@ -26,7 +26,9 @@ IG_IMPERSONATE = _env("IG_IMPERSONATE")
 TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL_HOURS = max(12.0, float(_env("CHECK_INTERVAL_HOURS", "24")))
+# 0 = no automatic checks, only /check from Telegram; other values below 12 are clamped to 12
+_interval = float(_env("CHECK_INTERVAL_HOURS", "24"))
+CHECK_INTERVAL_HOURS = 0.0 if _interval <= 0 else max(12.0, _interval)
 ACTIVE_HOURS = range(8, 23)  # daemon mode never fetches at night
 JITTER_MIN = 20
 PAGE_SIZE = 12  # what the web dialog requests; only used without request.curl

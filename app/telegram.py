@@ -61,8 +61,20 @@ def delete(message_id: int) -> None:
         log.warning("%s", e)
 
 
+def download(file_id: str, max_bytes: int) -> bytes:
+    """Contents of a file sent to the bot (Bot API limit: 20 MB)."""
+    path = call("getFile", file_id=file_id)["result"]["file_path"]
+    try:  # the URL contains the token: never log it
+        r = requests.get(f"https://api.telegram.org/file/bot{config.TELEGRAM_BOT_TOKEN}/{path}", timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"telegram download: {type(e).__name__}") from None
+    if r.status_code != 200 or len(r.content) > max_bytes:
+        raise RuntimeError(f"telegram download: HTTP {r.status_code}, {len(r.content)} bytes")
+    return r.content
+
+
 def poll(handler) -> None:
-    """Long-poll forever; handler(text, message_id) only for the owner's chat."""
+    """Long-poll forever; handler(message) for text and file messages from the owner's chat only."""
     offset = None
     while offset is None:  # drain updates that arrived while we were down
         try:
@@ -82,9 +94,9 @@ def poll(handler) -> None:
         for u in updates:
             offset = u["update_id"] + 1
             msg = u.get("message") or {}
-            if str(msg.get("chat", {}).get("id")) != config.TELEGRAM_CHAT_ID or not msg.get("text"):
+            if str(msg.get("chat", {}).get("id")) != config.TELEGRAM_CHAT_ID or not (msg.get("text") or msg.get("document")):
                 continue
             try:
-                handler(msg["text"], msg["message_id"])
+                handler(msg)
             except Exception:
                 log.exception("command handler failed")
